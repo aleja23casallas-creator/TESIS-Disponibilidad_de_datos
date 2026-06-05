@@ -1,0 +1,344 @@
+---
+title: "TESIS-Preprocesamiento"
+format: pdf
+editor: visual
+---
+
+```{r,warning=FALSE,message=FALSE}
+
+library(tidyverse)
+library(readxl)
+library(openxlsx)
+library(janitor)
+library(naniar)
+library(mice)
+library(stringr)
+library(corrplot)
+library(caret)
+```
+
+### 1. Preprocesamiento y Limpieza de datos
+
+Tratamiento de `<` y `>`**:** Dividir por 2 los valores por debajo del límite de detección (LOD) es una práctica estándar en hidrogeoquímica. Justificación: Se aplicó el método de sustitución por la mitad del límite de detección para evitar el sesgo por truncamiento en variables traza.
+
+```{r}
+ruta <- "C:/Users/maria/Downloads/Documents/MAESTRIA/TESIS/Datos calidad del agua 2005_2024 - Original.xlsx"
+df <- read_excel(ruta, sheet = "BASE DE DATOS")
+
+df_limpio<-df
+
+str(df_limpio)
+df_limpio <- df_limpio %>%
+  mutate(FECHA = as.Date(FECHA))
+
+df_limpio <- df_limpio %>%
+  mutate(RESULTADO = case_when(
+    str_detect(as.character(RESULTADO), "<") ~ as.numeric(str_replace(as.character(RESULTADO), "<", "")) / 2,
+    str_detect(as.character(RESULTADO), ">") ~ as.numeric(str_replace(as.character(RESULTADO), ">", "")),
+    TRUE ~ as.numeric(as.character(RESULTADO))
+  ))
+```
+
+### 2. **Normalización de Unidades**
+
+El proceso de estandarización de las unidades de medida se ejecutó en dos etapas para garantizar la consistencia en los datos. En primer lugar, se aplicaron técnicas de limpieza de cadenas de texto para eliminar redundancias, espacios en blanco y variaciones sintácticas en los reportes de laboratorio. En segundo lugar, se realizó un análisis de concordancia entre las variables ambientales (`PROPIEDAD OBSERVADA`) y sus respectivas unidades físicas (`UNIDAD DEL RESULTADO`). Este control de calidad permitió detectar y corregir inconsistencias de escala.
+
+```{r}
+#Limpieza en nombres unidades de medida
+
+df_limpio <- df_limpio %>%
+  mutate(
+    #espacios en blanco
+    `UNIDAD DEL RESULTADO` = str_trim(`UNIDAD DEL RESULTADO`),
+    #todo a minúsculas y caracteres al final
+    `UNIDAD DEL RESULTADO` = str_to_lower(`UNIDAD DEL RESULTADO`),
+    `UNIDAD DEL RESULTADO` = str_replace_all(`UNIDAD DEL RESULTADO`, "\\.$", "")
+  )
+
+#verificar que cada parametro tiene una unica unidad del resultado
+unidad_xparametro <- df_limpio %>%
+  group_by(`PROPIEDAD OBSERVADA`) %>%
+  summarise(
+    unidades_distintas = n_distinct(`UNIDAD DEL RESULTADO`),
+    cuales_unidades = paste(unique(`UNIDAD DEL RESULTADO`), collapse = ", "),
+    total_registros = n()
+  ) %>%
+  filter(unidades_distintas > 1)
+
+print(unidad_xparametro)
+
+#Identificar si nitritos esta en unidad de medida (N) o Ion Nitrito
+comparativa_nitrito <- df_limpio %>%
+  filter(`PROPIEDAD OBSERVADA` == "NITRITO") %>% 
+  group_by(`UNIDAD DEL RESULTADO`) %>% 
+    #Calculamos métricas para evaluar la escala y coherencia de los datos
+  summarise(
+    cantidad_datos = n(),
+    valor_minimo = min(RESULTADO, na.rm = TRUE),
+    valor_maximo = max(RESULTADO, na.rm = TRUE),
+    mediana = median(RESULTADO, na.rm = TRUE),
+    promedio = mean(RESULTADO, na.rm = TRUE)
+  )
+
+print(comparativa_nitrito)
+
+df_limpio <- df_limpio %>%
+  mutate(`UNIDAD DEL RESULTADO` = if_else(
+    `PROPIEDAD OBSERVADA` == "NITRITO" & `UNIDAD DEL RESULTADO` == "mg/l",
+    "mg n-no2-/l", 
+    `UNIDAD DEL RESULTADO`
+  ))
+
+```
+
+### 3. Pivotado Estructurado de Datos (Formato Horizontal)
+
+El conjunto de datos fue transformado de un formato vertical (estructurado por registros individuales de variables) a un formato horizontal (donde cada fila es una muestra única con todos sus parámetros fisicoquímicos y metales alineados en columnas).
+
+```{r}
+# Validación de columna CODIGO__MUESTRA
+validacion_llave <- df_limpio %>%
+  group_by(CODIGO__MUESTRA) %>%
+  summarise(
+    n_fechas = n_distinct(FECHA),
+    n_puntos = n_distinct(`NOMBRE DEL PUNTO DE MONITOREO`)
+  ) %>%
+  filter(n_fechas > 1 | n_puntos > 1)
+
+print(validacion_llave)
+
+
+#PIVOTAR A HORIZONTAL 
+
+df_horizontal <- df_limpio %>%
+  mutate(parametro_unidad = paste0(`PROPIEDAD OBSERVADA`, "_(", `UNIDAD DEL RESULTADO`, ")")) %>%
+
+  select(
+    `NOMBRE DEL PUNTO DE MONITOREO`, LATITUD, LONGITUD, 
+    `ELEVACIÓN (m.s.n.m.)`, CORRIENTE, `Nombre Subzona Hidrográfica`,
+    CODIGO__MUESTRA, MUNICIPIO, FECHA,
+    parametro_unidad, RESULTADO
+  ) %>%
+  
+  #Pivot
+  pivot_wider(
+    names_from = parametro_unidad, 
+    values_from = RESULTADO
+  )
+
+colnames(df_horizontal)
+
+#Resumen de todos los parámetros
+resumen_calidad <- df_horizontal %>%
+  summarise(across(10:last_col(), list(
+    min = ~min(.x, na.rm = TRUE),
+    max = ~max(.x, na.rm = TRUE),
+    nas = ~sum(is.na(.x))
+  ))) %>%
+  pivot_longer(everything(), 
+               names_to = c("parametro", ".value"), 
+               names_sep = "_(?!.*_)") 
+
+print(resumen_calidad, n = Inf)
+```
+
+### 4. Tratamiento de valores faltantes
+
+Se estableció un criterio de exclusión restrictivo donde toda variable con un porcentaje de datos faltantes superior al 80% fue removida de la matriz de modelado, asegurando que las características seleccionadas cuenten con una representatividad física real en la cuenca. Adicionalmente, se evaluó la varianza marginal para identificar y descartar columnas con valores constantes (varianza cero) que no aportan poder predictivo al sistema. Finalmente, la estructura estadística y los patrones de distribución de los parámetros fisicoquímicos clave para el Río Bogotá se diagnosticaron mediante análisis de frecuencias (histogramas), permitiendo identificar sesgos, asimetrías o la necesidad de transformaciones previas al entrenamiento de los modelos.
+
+```{r}
+#Valores faltantes
+  reporte_faltantes <- df_horizontal %>%
+    miss_var_summary()
+    print(reporte_faltantes, n = Inf)
+
+variables_a_mantener <- reporte_faltantes %>%
+filter(pct_miss < 80) %>%
+pull(variable)
+df_final <- df_horizontal %>%
+  select(all_of(variables_a_mantener))
+print(paste("Columnas finales para el modelo:", ncol(df_final)))
+names(df_final)
+
+dim(df_final)
+nrow(df_final)
+ncol(df_final)
+str(df_final)
+
+print(paste("Total filas duplicadas:", sum(duplicated(df_final))))
+filas_duplicadas <- df_final[duplicated(df_final), ]
+print(filas_duplicadas)
+
+
+#Resumen de faltantes por fila
+reporte_filas <- df_final %>%
+  miss_case_summary()
+
+print(reporte_filas)
+
+#Visualización de faltantes 
+vis_miss(df_final, warn_large_data = FALSE) 
+
+#Columnas con un solo valor (varianza cero)
+num_data <- df_final %>% select(where(is.numeric))
+columnas_constantes <- sapply(num_data, function(x) sd(x, na.rm = TRUE)==0)
+nombres_constantes <- names(columnas_constantes[columnas_constantes == TRUE & !is.na(columnas_constantes)])
+print(nombres_constantes)
+```
+
+```{r unnamed-chunk-5}
+#| fig-width: 8
+#| fig-height: 10
+
+# Histograma para ver la distribución de  parámetros clave
+par(mfrow=c(3,2))
+hist(df_final$`pH_(unidades de ph)`, main="Distribución pH", col="lightblue")
+hist(df_final$`CONDUCTIVIDAD ELECTRICA_(µs/cm)`, main="Distribución Conductividad", col="lightgreen")
+hist(df_final$`NITRITO_(mg n-no2-/l)`, main="Distribución Nitritos", col="salmon")
+hist(df_final$`DEMANDA QUIMICA DE OXIGENO (DQO)_(mg o2/l)`, main="Distribución DQO", col="gold")
+hist(df_final$`SOLIDOS SUSPENDIDOS TOTALES_(mg/l)`, main="Distribución solidos Totales", col="#E41A1C")
+hist(df_final$`OXIGENO DISUELTO (OD)_(mg o2/l)`, main="Distribución Oxigeno", col="orchid2")
+```
+
+### 5. Imputación con MICE
+
+Se utilizó imputación múltiple por ecuaciones encadenadas (MICE) con el método PMM para tratar el vacío de datos, preservando las relaciones multivariadas y la distribución original de los parámetros fisicoquímicos. Metodológicamente, se incluyeron variables temporales de control (año y mes) y factores espaciales para que el proceso de imputación respetara la estacionalidad y la georreferenciación del Río Bogotá.
+
+Histogramas para validar vs anteriores, se demuestra visualmente que el método PMM preservó la forma original de los datos hídricos.
+
+```{r}
+
+#Imputacion
+
+columnas_para_mice <- df_final %>%
+  mutate(
+    año = year(FECHA),           
+    mes = as.factor(month(FECHA)),#Extrae el año y el mes de la fecha para que la imputación respete la dinámica temporal
+    across(where(is.character), as.factor)# Convierte las variables categóricas (como estación/punto de monitoreo) en factores
+  ) %>%
+  select(-CODIGO__MUESTRA, -FECHA, -LATITUD, -LONGITUD,- MUNICIPIO)
+
+#MICE
+imputacion_total <- mice(columnas_para_mice, 
+                         m = 1, 
+                         method = 'pmm', 
+                         seed = 500,ridge = 0.001)
+
+df_imput <- complete(imputacion_total)
+
+df_Modfinal <- df_imput %>%
+  mutate(CODIGO__MUESTRA = df_final$CODIGO__MUESTRA,
+         FECHA     = df_final$FECHA,
+         LATITUD = df_final$LATITUD,
+         LONGITUD = df_final$LONGITUD,
+         MUNICIPIO = df_final$MUNICIPIO)%>%
+select(
+  `NOMBRE DEL PUNTO DE MONITOREO`,LATITUD,LONGITUD,
+  `ELEVACIÓN (m.s.n.m.)`,CORRIENTE,MUNICIPIO,
+  FECHA,año,mes,
+  CODIGO__MUESTRA,
+  everything()
+)
+
+Casi_Varianza_Cero <- nearZeroVar(df_Modfinal, saveMetrics = TRUE)
+print(Casi_Varianza_Cero[Casi_Varianza_Cero$nzv == TRUE, ])
+
+#Valores faltantes data imputada
+sum(is.na(df_Modfinal))
+```
+
+```{r unnamed-chunk-5}
+#| fig-width: 8
+#| fig-height: 10
+
+# Histograma para ver la distribución de  parámetros clave data imputada
+par(mfrow=c(3,2))
+hist(df_Modfinal$`pH_(unidades de ph)`, main="Distribución pH", col="lightblue")
+hist(df_Modfinal$`CONDUCTIVIDAD ELECTRICA_(µs/cm)`, main="Distribución Conductividad", col="lightgreen")
+hist(df_Modfinal$`NITRITO_(mg n-no2-/l)`, main="Distribución Nitritos", col="salmon")
+hist(df_Modfinal$`DEMANDA QUIMICA DE OXIGENO (DQO)_(mg o2/l)`, main="Distribución DQO", col="gold")
+hist(df_Modfinal$`SOLIDOS SUSPENDIDOS TOTALES_(mg/l)`, main="Distribución solidos Totales", col="#E41A1C")
+hist(df_Modfinal$`OXIGENO DISUELTO (OD)_(mg o2/l)`, main="Distribución Oxigeno", col="orchid2")
+```
+
+### 6. Calculo del ICA
+
+La fase final de la estructuración de datos consistió en la formulación e implementación matemática del Índice de Calidad del Agua (`ICA`), fundamentado estrictamente en la Hoja Metodológica oficial del IDEAM. se cálculo de la siguiente manera:
+
+-   **Corrección barométrica y térmica:** Se estimó la presión atmosférica local y la solubilidad teórica del oxígeno en función de la cota altitudinal (`ELEVACIÓN (m.s.n.m.)`) y la temperatura del agua para cada registro, permitiendo calcular con precisión el porcentaje de saturación de oxígeno disuelto.
+
+-   **Determinación de subíndices (**$I_i$): Se parametrizó la transformación de las 5 variables fundamentales (Oxígeno Disuelto, Sólidos Suspendidos Totales, Demanda Química de Oxígeno, Conductividad Eléctrica y pH) en escalas adimensionales entre 0 y 1 mediante funciones continuas y condicionales lógicas.
+
+-   **Ponderación y Clasificación:** Se aplicó un modelo aditivo lineal donde cada subíndice aporta un peso ponderado equivalente del 20% ($w_i = 0.2$). El valor final continuo del ICA fue categorizado en cinco rangos de calidad hidrológica de acuerdo con los umbrales oficiales de gestión ambiental del instituto.
+
+```{r}
+#CÁLCULO DEL ICA (Basado en Hoja Metodológica feb-2025/IDEAM)
+df_final <- df_Modfinal %>%
+  mutate(
+# A. Oxígeno Saturación- se estima la presión atmosférica local (mmHg) usando la ecuación barométrica según la altitud del punto
+    presion_atm = 760 * exp(-`ELEVACIÓN (m.s.n.m.)` / 7990),
+
+    #se calcula la solubilidad teórica máxima del Oxígeno Disuelto (mg/L) a esa temperatura y presión específica
+    od_sat_teorico = (14.621 - 0.4477 * `TEMPERATURA_(°c)` + 0.0083 * `TEMPERATURA_(°c)`^2) * (presion_atm / 760),
+
+    #Determina el porcentaje real de saturación de Oxígeno Disuelto en el cuerpo hídrico
+    porcentaje_sat_od = (`OXIGENO DISUELTO (OD)_(mg o2/l)` / od_sat_teorico) * 100,
+    
+# B.CÁLCULO DE SUBÍNDICES (I_i)
+# Subíndice del Oxígeno Disuelto
+    i_od = pmax(0, pmin(1, 1 - abs(1 - (porcentaje_sat_od / 100)))),
+# Subíndice de Sólidos Suspendidos Totales    
+    i_sst = case_when(
+      `SOLIDOS SUSPENDIDOS TOTALES_(mg/l)` <= 4.5 ~ 1,
+      `SOLIDOS SUSPENDIDOS TOTALES_(mg/l)` >= 320 ~ 0,
+      TRUE ~ 1 - (-0.02 + 0.003* `SOLIDOS SUSPENDIDOS TOTALES_(mg/l)`)
+    ),
+# Subíndice de la Demanda Química de Oxígeno   
+    i_dqo = case_when(
+      `DEMANDA QUIMICA DE OXIGENO (DQO)_(mg o2/l)` <= 20 ~ 0.91,
+      `DEMANDA QUIMICA DE OXIGENO (DQO)_(mg o2/l)` > 20 & `DEMANDA QUIMICA DE OXIGENO (DQO)_(mg o2/l)` <= 25 ~ 0.71,
+      `DEMANDA QUIMICA DE OXIGENO (DQO)_(mg o2/l)` > 25 & `DEMANDA QUIMICA DE OXIGENO (DQO)_(mg o2/l)` <= 40 ~ 0.51,
+      `DEMANDA QUIMICA DE OXIGENO (DQO)_(mg o2/l)` > 40 & `DEMANDA QUIMICA DE OXIGENO (DQO)_(mg o2/l)` <= 80 ~ 0.26,
+      `DEMANDA QUIMICA DE OXIGENO (DQO)_(mg o2/l)` > 80 ~ 0.125
+    ),
+# Subíndice de Conductividad Eléctrica    
+    i_ce = 1 - (10^(-3.26 + 1.34 * log10(`CONDUCTIVIDAD ELECTRICA_(µs/cm)`))),
+    i_ce = pmax(0, i_ce),
+    
+# Subíndice de pH
+    i_ph = case_when(
+      `pH_(unidades de ph)` < 4 ~ 0.1,
+      `pH_(unidades de ph)` >= 4 & `pH_(unidades de ph)` <= 7 ~ 0.02628419*exp(`pH_(unidades de ph)`*0.520025),
+      `pH_(unidades de ph)` > 7 & `pH_(unidades de ph)` <= 8 ~ 1,
+      `pH_(unidades de ph)` > 8 & `pH_(unidades de ph)` <= 11 ~ 1 * exp((`pH_(unidades de ph)` - 8) * -0.5187742),
+      `pH_(unidades de ph)` > 11 ~ 0.1,
+      TRUE ~ 0
+    ),
+    
+# C. CÁLCULO FINAL ICA 
+    ICA = (i_od * 0.2) + (i_sst * 0.2) + (i_dqo * 0.2) + (i_ce * 0.2) + (i_ph * 0.2),
+    
+# D. Etiqueta de Calidad
+    clasificacion_ica = case_when(
+      ICA > 0.90 & ICA <= 1.00 ~ "Buena",      # Azul
+      ICA > 0.70 & ICA <= 0.90 ~ "Aceptable",  # verde
+      ICA > 0.50 & ICA <= 0.70 ~ "Regular",    # Amarillo
+      ICA > 0.25 & ICA <= 0.50 ~ "Mala",       # Naranja
+      ICA >= 0.00 & ICA <= 0.25 ~ "Muy Mala"   # Rojo
+
+    ))
+
+
+df_final <- df_final %>%
+  select(
+    `NOMBRE DEL PUNTO DE MONITOREO`, LATITUD, LONGITUD,
+    `ELEVACIÓN (m.s.n.m.)`, CORRIENTE, MUNICIPIO,
+    FECHA, año, mes,
+    CODIGO__MUESTRA,
+    everything()
+  )
+```
+
+```{r}
+df_final
+```
